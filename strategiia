@@ -1,0 +1,567 @@
+from freqtrade.strategy import IStrategy
+from pandas import DataFrame
+import pandas as pd
+import numpy as np
+import talib.abstract as ta
+import logging
+import os
+import sys
+
+
+# Добавляем текущую папку, чтобы подхватить твои модули, если они есть.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
+
+# Пытаемся использовать твои модули.
+# Если их нет, используем безопасные заглушки, чтобы стратегия работала.
+try:
+    from risk_manager import RiskManager
+except Exception:
+    class RiskManager:
+        """
+        Простой fallback-риск-менеджер.
+        Используется только если файл risk_manager.py не найден.
+        """
+
+        def __init__(self, config: dict):
+            self.config = config or {}
+            self.risk_per_trade = float(self.config.get("risk_per_trade", 0.01))
+            self.max_open_risk = float(self.config.get("max_open_risk", 0.05))
+            self.open_risk = 0.0
+            self.peak = 0.0
+
+        def update_peak(self, capital: float):
+            if capital is None:
+                return
+            self.peak = max(self.peak, float(capital))
+
+        def can_trade(self, capital: float):
+            if self.open_risk + self.risk_per_trade > self.max_open_risk:
+                return (
+                    False,
+                    f"open_risk {self.open_risk:.2%} + new {self.risk_per_trade:.2%} "
+                    f"> max {self.max_open_risk:.2%}"
+                )
+            return True, ""
+
+        def add_open_risk(self, amount: float):
+            self.open_risk += float(amount)
+
+        def remove_open_risk(self, amount: float):
+            self.open_risk = max(0.0, self.open_risk - float(amount))
+
+
+try:
+    from market_regime import MarketRegimeFilter
+except Exception:
+    class MarketRegimeFilter:
+        """
+        Простой fallback-фильтр режима рынка.
+        Используется только если файл market_regime.py не найден.
+
+        Чтобы не ломать бэктест без твоего фильтра, здесь он ничего не блокирует.
+        Если хочешь жесткий режимный фильтр, подключи свой market_regime.py.
+        """
+
+        def is_trending(self, df: DataFrame) -> bool:
+            return True
+
+        def regime_label(self, df: DataFrame) -> str:
+            return "fallback_no_filter"
+
+
+logger = logging.getLogger(__name__)
+
+
+class MyStrategy(IStrategy):
+    """
+    Исправленная версия стратегии.
+
+    Основные изменения:
+    - исправлен custom_stoploss;
+    - stoploss = -0.10 вместо -0.99;
+    - ATR-стоп и трейлинг считаются корректно относительно текущей цены;
+    - безубыток и трейлинг активируются позже;
+    - вход стал менее перегруженным;
+    - убрано ограничение RSI < 70;
+    - ROI отключен, чтобы дать прибыли расти через трейлинг.
+    """
+
+    INTERFACE_VERSION = 3
+
+    # Для начала оставляю 1h, как у тебя.
+    # Если хочешь тестировать более стабильный трендовый вариант, поставь '4h'.
+    timeframe = "1h"
+
+    can_short = False
+    process_only_new_candles = True
+    startup_candle_count = 250
+
+    # Аварийный стоп на случай некорректной логики.
+    # Раньше было -0.99, что почти отключало защиту.
+    stoploss = -0.10
+
+    use_custom_stoploss = True
+    use_exit_signal = False
+    exit_profit_only = False
+    trailing_stop = False
+
+    # ROI фактически отключен.
+    # Пусть выходом управляет трейлинг/стоп.
+    minimal_roi = {
+        "0": 100
+    }
+
+    # Параметры входа.
+    # Если сделок слишком мало, можно смягчить:
+    # entry_rsi_min = 52, entry_adx_min = 18, entry_volume_min = 1.0
+    entry_rsi_min = 55.0
+    entry_adx_min = 20.0
+    entry_volume_min = 1.2
+    entry_roc20_min = 1.0
+
+    # Параметры стоп-логики.
+    atr_multiplier_initial = 2.5
+
+    # Жесткий максимальный стоп от цены входа.
+    hard_stop_pct = 0.08
+
+    # Безубыток включаем не на +2%, а позже.
+    breakeven_profit = 0.03
+
+    # После +3% фиксируем минимум около безубытка/комиссий.
+    breakeven_lock_pct = 0.001
+
+    # Трейлинг включаем позже, чтобы не резать нормальные откаты.
+    trail_activation_profit = 0.045
+
+    # После активации трейлинга фиксируем минимум +0.2%.
+    profit_lock_pct = 0.002
+
+    # Фильтр по BTC.
+    # Если BTC/USDT есть в данных и стратегия видит его,
+    # лонги разрешаются только когда BTC выше EMA200.
+    # Если BTC недоступен, фильтр просто не мешает.
+    use_btc_regime_filter = True
+    btc_pair = "BTC/USDT"
+
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.risk_manager = RiskManager(config.get("risk_manager", {}))
+        self.regime_filter = MarketRegimeFilter()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _notify(self, message: str):
+        """
+        Безопасная отправка сообщений.
+        В backtesting может не иметь большого смысла,
+        но не должно ломать выполнение.
+        """
+        try:
+            if self.dp and hasattr(self.dp, "send_msg"):
+                self.dp.send_msg(message)
+        except Exception as e:
+            logger.debug(f"Notify error: {e}")
+
+    def _btc_trend_ok(self) -> bool:
+        """
+        Возвращает True, если BTC/USDT выше EMA200 на текущем таймфрейме.
+
+        Если данные по BTC недоступны, возвращает True,
+        чтобы не ломать стратегию.
+        """
+        if not self.use_btc_regime_filter:
+            return True
+
+        try:
+            df, _ = self.dp.get_analyzed_dataframe(self.btc_pair, self.timeframe)
+
+            if df is None or df.empty or len(df) < 200:
+                return True
+
+            last = df.iloc[-1]
+
+            close = last.get("close")
+            ema_200 = last.get("ema_200")
+
+            if pd.isna(close) or pd.isna(ema_200):
+                return True
+
+            return float(close) > float(ema_200)
+
+        except Exception:
+            # Если BTC недоступен, не блокируем торговлю.
+            return True
+
+    def _get_initial_risk_pct(self, trade) -> float:
+        """
+        Пытается получить начальный риск сделки в процентах от цены входа.
+
+        Используется для корректного расчета R-результата.
+        Если начальный стоп неизвестен, используем жесткий стоп как запасной вариант.
+        """
+        try:
+            initial_stop = getattr(trade, "initial_stop_loss", None)
+
+            if initial_stop is None or not np.isfinite(initial_stop) or initial_stop <= 0:
+                initial_stop = getattr(trade, "stop_loss", None)
+
+            if (
+                initial_stop is not None
+                and np.isfinite(initial_stop)
+                and initial_stop > 0
+                and trade.open_rate > 0
+            ):
+                risk_pct = abs(float(trade.open_rate) - float(initial_stop)) / float(trade.open_rate)
+                if risk_pct > 0:
+                    return float(risk_pct)
+
+        except Exception:
+            pass
+
+        # Запасной вариант, если стоп неизвестен.
+        return float(self.hard_stop_pct)
+
+    # ------------------------------------------------------------------
+    # Indicators
+    # ------------------------------------------------------------------
+
+    def populate_indicators(self, df: DataFrame, metadata: dict) -> DataFrame:
+        df["ema_20"] = ta.EMA(df["close"], timeperiod=20)
+        df["ema_50"] = ta.EMA(df["close"], timeperiod=50)
+        df["ema_200"] = ta.EMA(df["close"], timeperiod=200)
+
+        df["adx"] = ta.ADX(df["high"], df["low"], df["close"], timeperiod=14)
+        df["atr"] = ta.ATR(df["high"], df["low"], df["close"], timeperiod=14)
+
+        df["rsi"] = ta.RSI(df["close"], timeperiod=14)
+
+        df["roc_20"] = ta.ROC(df["close"], timeperiod=20)
+        df["linreg_slope"] = ta.LINEARREG_SLOPE(df["close"], timeperiod=20)
+
+        df["volume_ma"] = df["volume"].rolling(20).mean()
+        df["volume_rel"] = df["volume"] / df["volume_ma"].replace(0, np.nan)
+
+        df["highest_20"] = df["high"].rolling(20).max()
+
+        macd = ta.MACD(df["close"], fastperiod=12, slowperiod=26, signalperiod=9)
+        df["macd"] = macd[0]
+        df["macd_signal"] = macd[1]
+        df["macd_hist"] = macd[2]
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Entry
+    # ------------------------------------------------------------------
+
+    def populate_entry_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Упрощенный вход по сравнению с исходной версией.
+
+        Логика:
+        - тренд подтвержден: цена выше EMA200, EMA50 выше EMA200, цена выше EMA50;
+        - пробой 20-свечного максимума;
+        - сила тренда: ADX выше порога;
+        - моментум: RSI выше порога, ROC20 положительный, наклон линейной регрессии положительный;
+        - MACD подтверждает;
+        - объем выше среднего.
+
+        Верхнее ограничение RSI < 70 убрано,
+        потому что сильные пробои часто имеют RSI выше 70.
+        """
+
+        entry_long = (
+            # Базовый тренд
+            (df["close"] > df["ema_200"]) &
+            (df["ema_50"] > df["ema_200"]) &
+            (df["close"] > df["ema_50"]) &
+
+            # Пробой максимума
+            (df["close"] >= df["highest_20"].shift(1)) &
+
+            # Сила тренда
+            (df["adx"] > self.entry_adx_min) &
+
+            # Моментум
+            (df["rsi"] > self.entry_rsi_min) &
+            (df["roc_20"] > self.entry_roc20_min) &
+            (df["linreg_slope"] > 0) &
+
+            # MACD подтверждение
+            (df["macd"] > df["macd_signal"]) &
+
+            # Объем подтверждение
+            (df["volume_rel"] > self.entry_volume_min)
+        )
+
+        df.loc[entry_long, ["enter_long", "enter_tag"]] = [1, "murphy_clenow_v4_fixed"]
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Exit
+    # ------------------------------------------------------------------
+
+    def populate_exit_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Выход по сигналам отключен.
+        Управление выходом через custom_stoploss.
+        """
+        return df
+
+    # ------------------------------------------------------------------
+    # Custom stoploss
+    # ------------------------------------------------------------------
+
+    def custom_stoploss(
+        self,
+        pair,
+        trade,
+        current_time,
+        current_rate,
+        current_profit,
+        **kwargs
+    ) -> float:
+        """
+        Исправленный custom_stoploss.
+
+        Важно:
+        - возвращаем значение относительно current_rate;
+        - значение должно быть отрицательным;
+        - стоп не должен раздвигаться вниз;
+        - жесткий стоп от цены входа ограничивает максимальный риск.
+        """
+
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        except Exception:
+            return -self.hard_stop_pct
+
+        if dataframe is None or dataframe.empty:
+            return -self.hard_stop_pct
+
+        last_candle = dataframe.iloc[-1]
+        atr = last_candle.get("atr")
+
+        try:
+            atr = float(atr)
+        except Exception:
+            return -self.hard_stop_pct
+
+        if (
+            not np.isfinite(atr)
+            or atr <= 0
+            or current_rate is None
+            or current_rate <= 0
+            or trade.open_rate is None
+            or trade.open_rate <= 0
+        ):
+            return -self.hard_stop_pct
+
+        current_rate = float(current_rate)
+        open_rate = float(trade.open_rate)
+
+        # Жесткий стоп от цены входа: например, -8%.
+        hard_stop_price = open_rate * (1.0 - self.hard_stop_pct)
+
+        # ATR-стоп от текущей цены.
+        atr_stop_price = current_rate - (self.atr_multiplier_initial * atr)
+
+        # Не позволяем стопу опускаться ниже уже установленного.
+        previous_stop = getattr(trade, "stop_loss", 0.0)
+
+        try:
+            previous_stop = float(previous_stop)
+        except Exception:
+            previous_stop = 0.0
+
+        if not np.isfinite(previous_stop) or previous_stop <= 0:
+            previous_stop = 0.0
+
+        if previous_stop > 0:
+            atr_stop_price = max(atr_stop_price, previous_stop)
+
+        # Логика управления стопом по прибыли.
+        if current_profit >= self.trail_activation_profit:
+            # Трейлинг активирован.
+            # Фиксируем минимум profit_lock_pct выше цены входа.
+            stop_price = max(
+                atr_stop_price,
+                hard_stop_price,
+                open_rate * (1.0 + self.profit_lock_pct)
+            )
+
+        elif current_profit >= self.breakeven_profit:
+            # Зона безубытка/компенсации комиссии.
+            stop_price = max(
+                atr_stop_price,
+                hard_stop_price,
+                open_rate * (1.0 + self.breakeven_lock_pct)
+            )
+
+        else:
+            # До безубытка используем ATR и жесткий стоп.
+            stop_price = max(
+                atr_stop_price,
+                hard_stop_price
+            )
+
+        if not np.isfinite(stop_price) or stop_price <= 0:
+            return -self.hard_stop_pct
+
+        # Конвертируем абсолютную стоп-цену в соотношение относительно текущей цены.
+        stop_ratio = stop_price / current_rate - 1.0
+
+        if not np.isfinite(stop_ratio):
+            return -self.hard_stop_pct
+
+        # Freqtrade ожидает отрицательный стоп.
+        # Если стоп вдруг оказывается выше текущей цены,
+        # ставим минимально разумный стоп ниже текущей цены.
+        return float(max(min(stop_ratio, -0.001), -0.5))
+
+    # ------------------------------------------------------------------
+    # Trade entry confirmation
+    # ------------------------------------------------------------------
+
+    def confirm_trade_entry(
+        self,
+        pair,
+        order_type,
+        amount,
+        rate,
+        time_in_force,
+        current_time,
+        entry_tag,
+        side,
+        **kwargs
+    ) -> bool:
+        """
+        Подтверждение входа.
+
+        Использует:
+        - твой MarketRegimeFilter, если он доступен;
+        - опциональный фильтр по BTC;
+        - RiskManager.
+        """
+
+        capital = 0.0
+
+        try:
+            if self.wallets:
+                capital = float(self.wallets.get_total_stake_amount())
+        except Exception:
+            capital = 0.0
+
+        try:
+            self.risk_manager.update_peak(capital)
+        except Exception:
+            pass
+
+        try:
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        except Exception:
+            df = None
+
+        if df is None or df.empty:
+            return False
+
+        # Твой внешний фильтр режима рынка.
+        try:
+            if not self.regime_filter.is_trending(df):
+                regime = self.regime_filter.regime_label(df)
+                self._notify(f"Пропущен {pair}: режим {regime}")
+                return False
+        except Exception:
+            # Если фильтр сломался, не блокируем торговлю.
+            pass
+
+        # Дополнительный фильтр по BTC.
+        if not self._btc_trend_ok():
+            self._notify(f"Пропущен {pair}: BTC вне восходящего режима")
+            return False
+
+        # Риск-менеджер.
+        try:
+            can_trade, reason = self.risk_manager.can_trade(capital)
+            if not can_trade:
+                self._notify(f"Заблокирован {pair}: {reason}")
+                return False
+        except Exception:
+            pass
+
+        risk_amount = getattr(self.risk_manager, "risk_per_trade", 0.01)
+
+        try:
+            self.risk_manager.add_open_risk(risk_amount)
+        except Exception:
+            pass
+
+        try:
+            self._notify(f"Вход {pair} цена={float(rate):.8g} тег={entry_tag}")
+        except Exception:
+            pass
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Trade exit confirmation
+    # ------------------------------------------------------------------
+
+    def confirm_trade_exit(
+        self,
+        pair,
+        trade,
+        order_type,
+        amount,
+        rate,
+        time_in_force,
+        exit_reason,
+        current_time,
+        **kwargs
+    ) -> bool:
+        """
+        Подтверждение выхода и логирование результата.
+
+        Здесь также исправлен R-результат:
+        он считается от реального начального стопа, если он доступен,
+        а не от произвольного 0.25%.
+        """
+
+        try:
+            profit = trade.calc_profit_ratio(rate)
+        except Exception:
+            profit = 0.0
+
+        risk_pct = self._get_initial_risk_pct(trade)
+
+        if risk_pct > 0:
+            r_result = profit / risk_pct
+        else:
+            r_result = 0.0
+
+        risk_amount = getattr(self.risk_manager, "risk_per_trade", 0.01)
+
+        try:
+            self.risk_manager.remove_open_risk(risk_amount)
+        except Exception:
+            pass
+
+        emoji = "✅" if profit > 0 else "❌"
+
+        try:
+            self._notify(
+                f"{emoji} Закрыта {pair}\n"
+                f"P&L: {profit:.2%}\n"
+                f"Причина: {exit_reason}\n"
+                f"R-результат: {r_result:.2f}R"
+            )
+        except Exception:
+            pass
+
+        return True
+      
